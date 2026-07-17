@@ -38,7 +38,7 @@ use matrix_sdk_ui::timeline::{
 use mime::Mime;
 use reply::{EmbeddedEventDetails, InReplyToDetails};
 use ruma::{
-    EventId, UInt, assign,
+    EventId, OwnedMxcUri, UInt, assign,
     events::{
         AnyMessageLikeEventContent,
         location::{AssetType as RumaAssetType, LocationContent, ZoomLevel},
@@ -54,6 +54,7 @@ use ruma::{
             LocationMessageEventContent, MessageType, RoomMessageEventContentWithoutRelation,
             TextMessageEventContent,
         },
+        sticker::StickerEventContent,
     },
 };
 use tokio::sync::Mutex;
@@ -394,6 +395,30 @@ impl Timeline {
             Ok(handle) => Ok(Arc::new(SendHandle::new(handle))),
             Err(err) => {
                 error!("error when sending a message: {err}");
+                Err(err.into())
+            }
+        }
+    }
+
+    /// Queues a sticker event in the room's send queue so it's processed for
+    /// sending later.
+    ///
+    /// The sticker's media must have already been uploaded, with `url` being
+    /// its `mxc://` URI.
+    ///
+    /// Returns an abort handle that allows to abort sending, if it hasn't
+    /// happened yet.
+    pub async fn send_sticker(
+        self: Arc<Self>,
+        body: String,
+        url: String,
+        info: ImageInfo,
+    ) -> Result<Arc<SendHandle>, ClientError> {
+        let content = StickerEventContent::new(body, info.into(), OwnedMxcUri::from(url));
+        match self.inner.send(AnyMessageLikeEventContent::Sticker(content)).await {
+            Ok(handle) => Ok(Arc::new(SendHandle::new(handle))),
+            Err(err) => {
+                error!("error when sending a sticker: {err}");
                 Err(err.into())
             }
         }
