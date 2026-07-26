@@ -97,5 +97,74 @@ into your language of choice.
 
 [Apache-2.0](https://www.apache.org/licenses/LICENSE-2.0)
 
+## What this fork changes
+
+This fork adds **one method** to upstream `matrix-rust-sdk`. Everything else is
+untouched.
+
+| branch | contents |
+|---|---|
+| `main` | a plain mirror of `matrix-org/matrix-rust-sdk` |
+| `develop` | `main` + the change below |
+
+To take upstream updates, move `develop` onto the newer `main` — there is only
+the one commit to carry across.
+
+### `Timeline::send_sticker`
+
+One method, in `bindings/matrix-sdk-ffi/src/timeline/mod.rs`:
+
+```rust
+pub async fn send_sticker(
+    self: Arc<Self>,
+    body: String,
+    url: String,
+    info: ImageInfo,
+) -> Result<Arc<SendHandle>, ClientError>
+```
+
+**What it does.** Queues an `m.sticker` event on the room's send queue. The
+media must already be uploaded — `url` is the `mxc://` URI you got back.
+
+**Why it was needed.** The FFI could send every kind of `m.room.message` —
+text, image, video, file — but not `m.sticker`. A sticker is its own event
+type rather than a message subtype, so no existing method could produce one,
+and a client had to send stickers as plain images instead.
+
+**Why it's written this way.** It hands the event to the same
+`Timeline::send` that every other sender uses, rather than talking to the
+send queue directly. A sticker therefore gets exactly what a message gets:
+
+- a local echo, so it appears in the timeline immediately instead of after
+  the round trip,
+- the send queue's retry behaviour when the network fails,
+- thread relations, applied by the inner timeline.
+
+Returning a `SendHandle` matches `send_image` and the other media senders, so
+a queued sticker can be aborted the same way.
+
+**Using it from Swift.** UniFFI generates the binding automatically:
+
+```swift
+let handle = try await timeline.sendSticker(body: body, url: mxcURI, info: imageInfo)
+```
+
+### Rebuilding the Swift bindings
+
+[element-x-ios](https://github.com/evan1ee/element-x-ios) consumes this repo as
+a local Swift package (`MatrixRustSDK: path: ../matrix-rust-sdk` in its
+`project.yml`). That package builds against the **generated xcframework**, not
+the Rust source, so editing Rust here changes nothing in the app until the
+bindings are regenerated:
+
+```sh
+cargo xtask swift build-framework
+```
+
+The output lands in `bindings/apple/generated/` and is gitignored, which is why
+switching branches in this repo doesn't disturb an app that is already
+building. It also means a stale xcframework will keep compiling happily against
+the old API — regenerate after every change here.
+
 [Matrix]: https://matrix.org/
 [Rust]: https://www.rust-lang.org/
