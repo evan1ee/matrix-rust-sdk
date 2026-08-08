@@ -21,10 +21,12 @@ use std::{
 };
 
 use once_cell::sync::OnceCell;
-use ruma::{EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId};
+use ruma::{
+    EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UInt,
+};
 use tantivy::{
-    Index, IndexReader, TantivyDocument, collector::TopDocs, directory::error::OpenDirectoryError,
-    query::QueryParser, schema::Value,
+    Index, IndexReader, ReloadPolicy, TantivyDocument, collector::TopDocs,
+    directory::error::OpenDirectoryError, query::QueryParser, schema::Value,
 };
 use tracing::{debug, error, warn};
 
@@ -42,16 +44,50 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct IndexableEvent {
     /// The event's own id (primary key).
-    pub event_id: OwnedEventId,
+    pub(crate) event_id: OwnedEventId,
     /// The id used as the deletion key: the original event id for edits,
     /// otherwise the event's own id.
-    pub original_event_id: OwnedEventId,
+    pub(crate) original_event_id: OwnedEventId,
     /// The sender of the event.
-    pub sender: OwnedUserId,
+    pub(crate) sender: OwnedUserId,
     /// The origin server timestamp of the event.
-    pub timestamp: MilliSecondsSinceUnixEpoch,
+    ///
+    /// Please use the `matrix_sdk_common::TimelineEvent::timestamp` as much as
+    /// possible as it protects against malformed `origin_server_ts`. At worst,
+    /// use the `matrix_sdk_common::serde_helpers::extract_timestamp` function.
+    pub(crate) timestamp: Option<MilliSecondsSinceUnixEpoch>,
     /// The text to index for this event.
-    pub body: String,
+    pub(crate) body: String,
+}
+
+/// Maximum value for the timestamp to not overflow when converted to
+/// nanoseconds by Tantivy. See [`IndexableEvent::new`] to learn more.
+const MAX_MILLISECONDS: u64 = (i64::MAX / 1_000_000).cast_unsigned();
+
+impl IndexableEvent {
+    /// Create a new [`IndexableEvent`].
+    pub fn new(
+        event_id: OwnedEventId,
+        original_event_id: OwnedEventId,
+        sender: OwnedUserId,
+        mut timestamp: Option<MilliSecondsSinceUnixEpoch>,
+        body: String,
+    ) -> Self {
+        // Tantivy will transform the number of milliseconds to nanoseconds
+        // by multiplying by 1_000_000 [1]. If the number of milliseconds is too
+        // big, the multiplication will overflow.
+        //
+        // To avoid this panic, we cap the number of milliseconds to a maximum value.
+        //
+        // [1]: https://github.com/quickwit-oss/tantivy/blob/31ca1a8ba290b425f871d2e2384592045ec01b8d/common/src/datetime.rs#L62-L67
+        if let Some(timestamp) = &mut timestamp {
+            *timestamp = MilliSecondsSinceUnixEpoch(
+                timestamp.get().min(UInt::new_saturating(MAX_MILLISECONDS)),
+            );
+        }
+
+        Self { event_id, original_event_id, sender, timestamp, body }
+    }
 }
 
 /// A struct to represent the operations on a [`RoomIndex`]
@@ -120,8 +156,16 @@ impl RoomIndex {
     }
 
     /// Get or create the cached [`IndexReader`] for this index.
+    ///
+    /// The reload policy is [`ReloadPolicy::Manual`]: we are the only writer of
+    /// this index, and every commit goes through
+    /// [`RoomIndex::commit_and_reload`], which reloads explicitly. Tantivy's
+    /// default policy would instead spawn one meta file watcher thread per
+    /// index, i.e. one per room, and panics if that thread cannot be spawned.
     fn reader(&self) -> Result<&IndexReader, IndexError> {
-        self.reader.get_or_try_init(|| Ok(self.index.reader_builder().try_into()?))
+        self.reader.get_or_try_init(|| {
+            Ok(self.index.reader_builder().reload_policy(ReloadPolicy::Manual).try_into()?)
+        })
     }
 
     /// Commit added events to [`RoomIndex`]. The changes are not reflected in
@@ -342,6 +386,9 @@ impl RoomIndex {
     ///
     /// This which will add/remove/edit an events in the index based on the
     /// operations.
+    ///
+    /// Waits for background merge threads to prevent racing with subsequent
+    /// calls.
     pub fn bulk_execute(&mut self, operations: Vec<RoomIndexOperation>) -> Result<(), IndexError> {
         let mut writer = self.writer()?;
         let mut operations = operations.into_iter();
@@ -353,6 +400,7 @@ impl RoomIndex {
         }
 
         self.commit_and_reload(&mut writer)?;
+        writer.wait_merging_threads()?;
 
         Ok(())
     }
@@ -394,10 +442,11 @@ mod tests {
         room_id, user_id,
     };
 
-    use crate::{
-        error::IndexError,
-        index::{IndexableEvent, RoomIndex, RoomIndexOperation, builder::RoomIndexBuilder},
+    use super::{
+        IndexableEvent, MAX_MILLISECONDS, MilliSecondsSinceUnixEpoch, RoomIndex,
+        RoomIndexOperation, UInt, builder::RoomIndexBuilder,
     };
+    use crate::error::IndexError;
 
     /// Build an [`IndexableEvent`] from a text room message (tests only handle
     /// text).
@@ -409,19 +458,21 @@ mod tests {
             Some(Relation::Replacement(replacement)) => replacement.event_id.clone(),
             _ => event.event_id.clone(),
         };
-        IndexableEvent {
-            event_id: event.event_id.clone(),
+
+        IndexableEvent::new(
+            event.event_id.clone(),
             original_event_id,
-            sender: event.sender.clone(),
-            timestamp: event.origin_server_ts,
-            body: content.body.clone(),
-        }
+            event.sender.clone(),
+            Some(event.origin_server_ts),
+            content.body.clone(),
+        )
     }
 
     /// Helper function to add a regular message to the index
     ///
     /// # Panic
-    /// Panics when event is not a [`OriginalSyncRoomMessageEvent`] with no
+    ///
+    /// Panics when event is not an [`OriginalSyncRoomMessageEvent`] with no
     /// relations.
     fn index_message(
         index: &mut RoomIndex,
@@ -464,7 +515,89 @@ mod tests {
             .sender(user_id!("@user_id:localhost"))
             .into_any_sync_message_like_event();
 
-        index_message(&mut index, event).expect("failed to add event: {res:?}");
+        index_message(&mut index, event).expect("failed to add event");
+    }
+
+    #[test]
+    fn test_add_event_with_no_timestamp() {
+        let mut index = RoomIndexBuilder::new_in_memory(room_id!("!r")).build();
+
+        index
+            .execute(RoomIndexOperation::Add(IndexableEvent::new(
+                event_id!("$ev").to_owned(),
+                event_id!("$ev").to_owned(),
+                user_id!("@mnt_io:matrix.org").to_owned(),
+                None,
+                "body".to_owned(),
+            )))
+            .expect("failed to add event");
+    }
+
+    #[test]
+    fn test_add_event_with_raw_malformed_timestamp_must_not_panic() {
+        let mut index = RoomIndexBuilder::new_in_memory(room_id!("!r")).build();
+
+        index
+            .execute(RoomIndexOperation::Add(IndexableEvent::new(
+                event_id!("$ev").to_owned(),
+                event_id!("$ev").to_owned(),
+                user_id!("@mnt_io:matrix.org").to_owned(),
+                Some(MilliSecondsSinceUnixEpoch(UInt::new(151393755000000).unwrap())),
+                "body".to_owned(),
+            )))
+            .expect("failed to add event");
+    }
+
+    #[test]
+    fn test_add_event_with_malformed_timestamp_must_not_panic() {
+        let room_id = room_id!("!r");
+        let mut index = RoomIndexBuilder::new_in_memory(room_id).build();
+
+        let body = "body".to_owned();
+        let event = EventFactory::new()
+            .server_ts(151393755000000)
+            .text_msg(body.clone())
+            .event_id(event_id!("$ev"))
+            .room(room_id)
+            .sender(user_id!("@mnt_io:matrix.org"))
+            .into_event();
+
+        index
+            .execute(RoomIndexOperation::Add(IndexableEvent::new(
+                event.event_id().unwrap().to_owned(),
+                event.event_id().unwrap().to_owned(),
+                event.sender().unwrap(),
+                event.timestamp(),
+                body,
+            )))
+            .expect("failed to add event");
+    }
+
+    #[test]
+    fn test_indexable_event_timestamp_is_capped() {
+        let event_id = event_id!("$ev").to_owned();
+        let sender = user_id!("@mnt_io:matrix.org").to_owned();
+        let body = "body".to_owned();
+
+        // Not capped.
+        let event = IndexableEvent::new(
+            event_id.clone(),
+            event_id.clone(),
+            sender.clone(),
+            Some(MilliSecondsSinceUnixEpoch(UInt::new(MAX_MILLISECONDS).unwrap())),
+            body.clone(),
+        );
+        assert_eq!(event.timestamp.unwrap().get(), UInt::new(MAX_MILLISECONDS).unwrap());
+
+        // Capped!
+        let event = IndexableEvent::new(
+            event_id.clone(),
+            event_id,
+            sender,
+            Some(MilliSecondsSinceUnixEpoch(UInt::new(MAX_MILLISECONDS + 42).unwrap())),
+            body,
+        );
+        assert_eq!(event.timestamp.unwrap().get(), UInt::new(MAX_MILLISECONDS).unwrap());
     }
 
     #[test]

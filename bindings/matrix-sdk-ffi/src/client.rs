@@ -2111,8 +2111,8 @@ impl Client {
 
                 for file_name in [
                     PathBuf::from(STATE_STORE_DATABASE_NAME),
-                    PathBuf::from(format!("{STATE_STORE_DATABASE_NAME}.wal")),
-                    PathBuf::from(format!("{STATE_STORE_DATABASE_NAME}.shm")),
+                    PathBuf::from(format!("{STATE_STORE_DATABASE_NAME}-wal")),
+                    PathBuf::from(format!("{STATE_STORE_DATABASE_NAME}-shm")),
                 ] {
                     let file_path = store_path.join(file_name);
                     if file_path.exists() {
@@ -2140,13 +2140,23 @@ impl Client {
     }
 
     /// Checks if the server supports the LiveKit RTC focus for placing calls.
-    pub async fn is_livekit_rtc_supported(&self) -> Result<bool, ClientError> {
-        Ok(self
-            .inner
-            .rtc_foci()
-            .await?
-            .iter()
-            .any(|focus| matches!(focus, RtcTransport::LiveKit(_))))
+    ///
+    /// Transports are discovered through the authenticated
+    /// `GET /_matrix/client/v1/rtc/transports` endpoint (MSC4143). If the
+    /// homeserver doesn't implement it and `fallback_to_well_known` is `true`,
+    /// then the well-known will be queried.
+    #[uniffi::method(default(fallback_to_well_known = false))]
+    pub async fn is_livekit_rtc_supported(
+        &self,
+        fallback_to_well_known: bool,
+    ) -> Result<bool, ClientError> {
+        let transports = match self.inner.rtc_transports().await? {
+            Some(transports) => transports,
+            // discovery not supported, fallback to well-known if allowed
+            None if fallback_to_well_known => self.inner.well_known_rtc_transports().await?,
+            None => return Ok(false),
+        };
+        Ok(transports.iter().any(|focus| matches!(focus, RtcTransport::LiveKit(_))))
     }
 
     /// Checks if the server supports user status.
@@ -2639,6 +2649,12 @@ impl Client {
         status_res?;
         call_res?;
         Ok(())
+    }
+
+    /// Enable or disable automatic mirroring of this device's MatrixRTC
+    /// participation into the MSC4426 `m.call` profile field.
+    pub fn enable_automatic_call_status(&self, enabled: bool) {
+        self.inner.enable_automatic_call_status(enabled);
     }
 }
 
