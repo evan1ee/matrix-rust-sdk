@@ -238,8 +238,12 @@ impl TimelineAction {
         let redaction_rules = room_data_provider.room_version_rules().redaction;
 
         let redacted_message_or_none = |event_type: MessageLikeEventType| {
-            (event_type != MessageLikeEventType::Reaction)
-                .then_some(TimelineItemContent::MsgLike(MsgLikeContent::redacted()))
+            (event_type != MessageLikeEventType::Reaction).then_some(TimelineItemContent::MsgLike(
+                MsgLikeContent {
+                    thread_summary: thread_summary.clone(),
+                    ..MsgLikeContent::redacted()
+                },
+            ))
         };
 
         match event {
@@ -1225,18 +1229,31 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
                 position: TimelineItemPosition::UpdateAt { timeline_item_index: idx },
                 ..
             } => {
-                trace!("Updating timeline item at position {idx}");
+                // The event cache redacts the raw event independently of the aggregations
+                // system, which reaches us here as an `UpdateAt`. If the item is already
+                // redacted (via the aggregations system, applied earlier in the diff batch),
+                // skip it to avoid a spurious duplicate update.
+                let already_redacted = item.content().is_redacted()
+                    && self.items[*idx]
+                        .as_event()
+                        .is_some_and(|existing| existing.content().is_redacted());
 
-                // Update all events that replied to this previously encrypted message.
-                Self::maybe_update_responses(
-                    self.meta,
-                    self.items,
-                    decrypted_event_id,
-                    EmbeddedEvent::from_timeline_item(&item),
-                );
+                if already_redacted {
+                    trace!("Item at position {idx} is already redacted, skipping the update");
+                } else {
+                    trace!("Updating timeline item at position {idx}");
 
-                let internal_id = self.items[*idx].internal_id.clone();
-                self.items.replace(*idx, TimelineItem::new(item, internal_id));
+                    // Update all events that replied to this previously encrypted message.
+                    Self::maybe_update_responses(
+                        self.meta,
+                        self.items,
+                        decrypted_event_id,
+                        EmbeddedEvent::from_timeline_item(&item),
+                    );
+
+                    let internal_id = self.items[*idx].internal_id.clone();
+                    self.items.replace(*idx, TimelineItem::new(item, internal_id));
+                }
             }
         }
 
@@ -1418,9 +1435,7 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
             };
 
             let new_reply_content = TimelineItemContent::MsgLike(
-                msglike
-                    .with_in_reply_to(in_reply_to)
-                    .with_kind(MsgLikeKind::Message(message.clone())),
+                msglike.with_in_reply_to(in_reply_to).with_kind(MsgLikeKind::Message(message)),
             );
             let new_reply_item = item.with_kind(event_item.with_content(new_reply_content));
             items.replace(timeline_item_index, new_reply_item);

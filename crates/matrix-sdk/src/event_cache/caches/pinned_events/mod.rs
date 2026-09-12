@@ -23,7 +23,7 @@ use matrix_sdk_base::{
     event_cache::{Event, Gap},
     linked_chunk::{LinkedChunkId, OwnedLinkedChunkId, Position, Update},
     serde_helpers::extract_redaction_target,
-    sync::{JoinedRoomUpdate, LeftRoomUpdate, Timeline},
+    sync::Timeline,
     task_monitor::BackgroundTaskHandle,
 };
 use matrix_sdk_common::executor::spawn;
@@ -37,7 +37,7 @@ use tracing::{debug, instrument, trace, warn};
 
 pub(super) use self::updates::PinnedEventsCacheUpdateSender;
 #[cfg(feature = "e2e-encryption")]
-use super::super::redecryptor::ResolvedUtd;
+use super::super::redecryptor::MaybeResolvedEvent;
 use super::{
     super::{
         EventCacheError, EventsOrigin, Result,
@@ -507,34 +507,37 @@ impl PinnedEventsCache {
     }
 
     /// Try to locate the events in the linked chunk corresponding to the given
-    /// list of decrypted events, and replace them, while alerting observers
+    /// list of resolved events, and replace them, while alerting observers
     /// about the update.
     #[cfg(feature = "e2e-encryption")]
-    pub(in super::super) async fn replace_utds(&self, events: &[ResolvedUtd]) -> Result<()> {
-        let mut guard = self.inner.state.write().await?;
+    pub(in super::super) async fn replace_in_memory_utds(
+        &self,
+        resolved_events: &[MaybeResolvedEvent],
+    ) -> Result<()> {
+        let mut state = self.inner.state.write().await?;
 
-        if guard.state.chunk.replace_utds(events) {
-            guard.propagate_changes().await?;
-            guard.notify_subscribers(EventsOrigin::Cache);
+        // Drain the updates to the store, events have already been updated before
+        // calling this method.
+        let _ = state.state.chunk.store_updates().take();
+
+        if state.state.chunk.replace_utds(resolved_events) {
+            state.propagate_changes().await?;
+            state.notify_subscribers(EventsOrigin::Cache);
         }
 
         Ok(())
     }
 
-    /// Handle a [`JoinedRoomUpdate`].
+    /// Handle an update from a joined room.
     #[instrument(skip_all, fields(room_id = %self.inner.room_id))]
-    pub(super) async fn handle_joined_room_update(&self, updates: JoinedRoomUpdate) -> Result<()> {
-        self.handle_timeline(updates.timeline).await?;
-
-        Ok(())
+    pub(super) async fn handle_joined_room_update(&self, timeline: Timeline) -> Result<()> {
+        self.handle_timeline(timeline).await
     }
 
-    /// Handle a [`LeftRoomUpdate`].
+    /// Handle an update from a left room.
     #[instrument(skip_all, fields(room_id = %self.inner.room_id))]
-    pub(super) async fn handle_left_room_update(&self, updates: LeftRoomUpdate) -> Result<()> {
-        self.handle_timeline(updates.timeline).await?;
-
-        Ok(())
+    pub(super) async fn handle_left_room_update(&self, timeline: Timeline) -> Result<()> {
+        self.handle_timeline(timeline).await
     }
 
     /// Handle a [`Timeline`], i.e. new events received by a sync for this
@@ -546,9 +549,7 @@ impl PinnedEventsCache {
 
         trace!("adding new {} events", timeline.events.len());
 
-        self.inner.state.write().await?.handle_sync(timeline).await?;
-
-        Ok(())
+        self.inner.state.write().await?.handle_sync(timeline).await
     }
 
     #[instrument(fields(%room_id = room.room_id()), skip(room, inner))]
@@ -630,6 +631,7 @@ impl PinnedEventsCache {
             let current_set = guard.state.current_event_ids().into_iter().collect::<BTreeSet<_>>();
 
             if !new_list.is_empty()
+                && new_list.len() == current_set.len()
                 && new_list.iter().all(|event_id| current_set.contains(event_id))
             {
                 // All the events in the pinned list are the same, don't reload.

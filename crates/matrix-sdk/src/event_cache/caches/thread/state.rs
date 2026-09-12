@@ -12,11 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::iter::empty;
+
+use eyeball::{AsyncLock, ObservableWriteGuard, SharedObservable};
 use eyeball_im::VectorDiff;
 use matrix_sdk_base::{
     apply_redaction, check_validity_of_replacement_events,
     deserialized_responses::ThreadSummary,
-    event_cache::{Event, Gap, store::EventCacheStoreLockGuard},
+    event_cache::{Event, Gap, store::EventCacheStoreLockGuard, thread::ThreadInfo},
     linked_chunk::{
         ChunkIdentifierGenerator, LinkedChunkId, OwnedLinkedChunkId, Position, Update, lazy_loader,
     },
@@ -26,14 +29,17 @@ use matrix_sdk_base::{
 use matrix_sdk_common::executor::spawn;
 use ruma::{
     EventId, OwnedEventId, OwnedRoomId, OwnedUserId,
-    events::{relation::RelationType, room::redaction::SyncRoomRedactionEvent},
+    events::{
+        receipt::ReceiptEventContent, relation::RelationType,
+        room::redaction::SyncRoomRedactionEvent,
+    },
     room_version_rules::RoomVersionRules,
 };
 use tokio::sync::broadcast::Sender;
 use tracing::{debug, error, instrument, trace};
 
 #[cfg(feature = "e2e-encryption")]
-use super::super::super::redecryptor::ResolvedUtd;
+use super::super::super::redecryptor::MaybeResolvedEvent;
 use super::{
     super::{
         super::{
@@ -47,11 +53,15 @@ use super::{
         },
         EventLocation,
         event_linked_chunk::{EventLinkedChunk, sort_positions_descending},
+        read_receipts::{
+            MaybeReceiptEventContent, ThreadReadReceiptEventFilter, compute_unread_counts,
+        },
         room::RoomEventCacheLinkedChunkUpdate,
         subscriber::SubscribersHandle,
     },
     ThreadEventCacheUpdateSender,
 };
+use crate::room::WeakRoom;
 
 pub struct ThreadEventCacheState {
     /// The room owning this thread.
@@ -61,6 +71,9 @@ pub struct ThreadEventCacheState {
     /// (and eventually the first in the linked chunk).
     pub thread_id: OwnedEventId,
 
+    /// A weak reference to the actual room.
+    weak_room: WeakRoom,
+
     /// The user's own user id.
     pub own_user_id: OwnedUserId,
 
@@ -69,6 +82,9 @@ pub struct ThreadEventCacheState {
 
     /// The linked chunk for this thread.
     thread_linked_chunk: EventLinkedChunk,
+
+    /// The information related to this thread, [`ThreadInfo`].
+    pub thread_info: SharedObservable<ThreadInfo, AsyncLock>,
 
     /// A clone of [`super::ThreadEventCacheInner::update_sender`].
     ///
@@ -103,9 +119,11 @@ impl ThreadEventCacheState {
     ///
     /// [`LinkedChunk`]: matrix_sdk_common::linked_chunk::LinkedChunk
     /// [`ThreadPagination`]: super::pagination::ThreadPagination
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         room_id: OwnedRoomId,
         thread_id: OwnedEventId,
+        weak_room: WeakRoom,
         own_user_id: OwnedUserId,
         room_version_rules: RoomVersionRules,
         store_guard: EventCacheStoreLockGuard,
@@ -114,10 +132,11 @@ impl ThreadEventCacheState {
     ) -> Result<Self> {
         let linked_chunk_id = LinkedChunkId::Thread(&room_id, &thread_id);
 
-        // Register the thread in the list of threads. It does nothing regarding events
-        // or linked chunks: it only remembers the thread exists for the thread list
-        // feature.
-        store_guard.remember_thread(&room_id, &thread_id).await?;
+        // Load the thread info.
+        //
+        // It will register the thread in the list of threads. It does nothing regarding
+        // events or linked chunks.
+        let thread_info = store_guard.load_thread_info(&room_id, &thread_id).await?;
 
         // Load the full linked chunk's metadata, so as to feed the order tracker.
         //
@@ -163,12 +182,14 @@ impl ThreadEventCacheState {
         Ok(ThreadEventCacheState {
             room_id,
             thread_id,
+            weak_room,
             own_user_id,
             room_version_rules,
             thread_linked_chunk: EventLinkedChunk::with_initial_linked_chunk(
                 linked_chunk,
                 full_linked_chunk_metadata,
             ),
+            thread_info: SharedObservable::new_async(thread_info),
             update_sender,
             linked_chunk_update_sender,
             waited_for_initial_prev_token: false,
@@ -358,7 +379,7 @@ impl<'a> StateLockReadGuard<'a, ThreadEventCacheState> {
     }
 
     /// See documentation of [`find_event`].
-    pub(super) async fn find_event(
+    pub(in super::super) async fn find_event(
         &self,
         event_id: &EventId,
     ) -> Result<Option<(EventLocation, Event)>> {
@@ -438,6 +459,7 @@ impl<'a> StateLockWriteGuard<'a, ThreadEventCacheState> {
     pub async fn handle_sync(
         &mut self,
         timeline: Timeline,
+        read_receipts: &MaybeReceiptEventContent,
     ) -> Result<(bool, Vec<VectorDiff<Event>>)> {
         let prev_batch_token = &timeline.prev_batch;
 
@@ -458,6 +480,13 @@ impl<'a> StateLockWriteGuard<'a, ThreadEventCacheState> {
         if all_duplicates {
             // If all events are duplicates, we don't need to do anything; ignore
             // the new events.
+            //
+            // We might have a new read receipt, though! If that's the case, handle it for
+            // unread counts tracking.
+            //
+            // Post-process the ephemeral events.
+            self.post_process_upserted_events(empty(), read_receipts.as_ref()).await?;
+
             return Ok((false, Vec::new()));
         }
 
@@ -480,7 +509,11 @@ impl<'a> StateLockWriteGuard<'a, ThreadEventCacheState> {
             &events,
         );
 
+        // Update the store.
         self.state.propagate_changes(&self.store).await?;
+
+        // Post-process newly inserted events.
+        self.post_process_upserted_events(events.iter(), read_receipts.as_ref()).await?;
 
         if timeline.limited && has_new_gap {
             // If there was a previous batch token for a limited timeline, unload the chunks
@@ -491,20 +524,82 @@ impl<'a> StateLockWriteGuard<'a, ThreadEventCacheState> {
             self.state.shrink_to_last_reloaded_chunk(&self.store).await?;
         }
 
-        // Do stuff for each event.
-        for event in events {
-            // Handle redaction.
-            self.maybe_apply_new_redaction(&event).await?;
-
-            // Save a bundled thread event, if there was one.
-            if let Some(bundled_thread) = event.bundled_latest_thread_event {
-                self.save_events([*bundled_thread]).await?;
-            }
-        }
-
         let timeline_event_diffs = self.state.thread_linked_chunk.updates_as_vector_diffs();
 
         Ok((has_new_gap, timeline_event_diffs))
+    }
+
+    /// Post-process newly inserted or updated events.
+    pub(super) async fn post_process_upserted_events<'i, I>(
+        &mut self,
+        events: I,
+        receipt_event: Option<&ReceiptEventContent>,
+    ) -> Result<()>
+    where
+        I: Iterator<Item = &'i Event>,
+    {
+        for event in events {
+            // Handle redaction.
+            self.maybe_apply_new_redaction(event).await?;
+
+            // Save a bundled thread event, if there was one.
+            if let Some(bundled_thread) = &event.bundled_latest_thread_event {
+                self.save_events([*bundled_thread.clone()]).await?;
+            }
+        }
+
+        self.update_read_receipts(receipt_event).await?;
+
+        Ok(())
+    }
+
+    /// Update read receipts for all events in the thread, based on the current
+    /// state of the in-memory linked chunk.
+    pub async fn update_read_receipts(
+        &mut self,
+        receipt_event: Option<&ReceiptEventContent>,
+    ) -> Result<()> {
+        let Some(room) = self.state.weak_room.get() else {
+            debug!("can't update read receipts: client's closing");
+            return Ok(());
+        };
+
+        let prev_read_receipts = self.state.thread_info.read().await.read_receipts.clone();
+        let mut read_receipts = prev_read_receipts.clone();
+
+        let client = room.client();
+        let event_filter = ThreadReadReceiptEventFilter::new(&self.state, client.state_store());
+
+        compute_unread_counts(
+            &self.state.own_user_id,
+            receipt_event,
+            &self.state.thread_linked_chunk,
+            &event_filter,
+            &mut read_receipts,
+            None,
+        )
+        .await;
+
+        if prev_read_receipts != read_receipts {
+            // The read receipt has changed! Do a little dance to update the
+            // `ThreadInfo` in the store.
+            let mut thread_info = self.state.thread_info.write().await;
+
+            ObservableWriteGuard::update(&mut thread_info, |thread_info| {
+                thread_info.read_receipts = read_receipts;
+            });
+
+            let room_id = &self.state.room_id;
+            let thread_id = &self.state.thread_id;
+
+            if let Err(error) =
+                self.store.update_thread_info(room_id, thread_id, &thread_info).await
+            {
+                error!(?room_id, ?thread_id, ?error, "Failed to update the `ThreadInfo`");
+            }
+        }
+
+        Ok(())
     }
 
     /// If the given event is a redaction, try to retrieve the
@@ -687,17 +782,15 @@ impl<'a> StateLockWriteGuard<'a, ThreadEventCacheState> {
     }
 
     /// Try to locate the events in the linked chunk corresponding to the given
-    /// list of decrypted events, and replace them, while alerting observers
+    /// list of resolved events, and replace them, while alerting observers
     /// about the update.
     #[cfg(feature = "e2e-encryption")]
     #[must_use = "Propagate `VectorDiff` updates via `TimelineVectorDiffs`"]
-    pub(in super::super) async fn replace_utds(
+    pub(in super::super) fn replace_in_memory_utds(
         &mut self,
-        events: &[ResolvedUtd],
+        resolved_events: &[MaybeResolvedEvent],
     ) -> Result<Option<Vec<VectorDiff<Event>>>> {
-        Ok(if self.thread_linked_chunk_mut().replace_utds(events) {
-            self.state.propagate_changes(&self.store).await?;
-
+        Ok(if self.thread_linked_chunk_mut().replace_utds(resolved_events) {
             Some(self.thread_linked_chunk_mut().updates_as_vector_diffs())
         } else {
             None

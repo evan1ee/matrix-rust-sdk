@@ -2,10 +2,8 @@
 name = "matrix-sdk-ffi"
 version = "0.18.0"
 edition = "2024"
-homepage = "https://github.com/matrix-org/matrix-rust-sdk"
 keywords = ["matrix", "chat", "messaging", "ffi"]
 license = "Apache-2.0"
-readme = "README.md"
 rust-version.workspace = true
 repository = "https://github.com/matrix-org/matrix-rust-sdk"
 publish = false
@@ -50,6 +48,7 @@ rustls-aws-lc-rs = ["matrix-sdk/rustls-aws-lc-rs", "matrix-sdk-ui/rustls-aws-lc-
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 chrono.workspace = true
 extension-trait = "1.0.2"
 eyeball-im.workspace = true

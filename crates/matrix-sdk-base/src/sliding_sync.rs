@@ -221,28 +221,10 @@ impl BaseClient {
 
         // Profile-only updates don't modify any rooms, so nothing else broadcasts
         // them. Surface the change so subscribers can react accordingly.
-        if !extensions.profiles.is_empty() {
-            let _ = self
-                .global_profile_updates_sender
-                .send(extensions.profiles.users.keys().cloned().collect());
-
-            // Nudge `RoomInfo` so hero status/call fields are re-read.
-            #[cfg(feature = "unstable-msc4426")]
-            for room in self.state_store.rooms() {
-                if room
-                    .hero_user_ids()
-                    .iter()
-                    .any(|user_id| extensions.profiles.users.contains_key(user_id))
-                {
-                    let _ = self.state_store.room_info_notable_update_sender.send(
-                        crate::RoomInfoNotableUpdate {
-                            room_id: room.room_id().to_owned(),
-                            reasons: crate::RoomInfoNotableUpdateReasons::HEROES,
-                        },
-                    );
-                }
-            }
-        }
+        self.notify_global_profile_updates(
+            extensions.profiles.users.keys().cloned().collect(),
+            state_store_guard,
+        )?;
 
         let mut context = processors::Context::default();
 
@@ -333,6 +315,8 @@ mod tests {
         uint, user_id,
     };
     use serde_json::json;
+    #[cfg(feature = "unstable-msc4426")]
+    use stream_assert::{assert_pending, assert_ready};
 
     use super::http;
     use crate::{
@@ -1682,7 +1666,11 @@ mod tests {
             .await
             .expect("Failed to process sync");
 
+        let room = client.get_room(room_id).expect("The room should be known");
+        let mut room_info_subscriber = room.subscribe_info();
         let mut room_info_notable_update = client.room_info_notable_update_receiver();
+
+        assert_pending!(room_info_subscriber);
 
         // When a subsequent sync carries only a profiles-extension update for Alice.
         let mut response = http::Response::new("1".to_owned());
@@ -1709,6 +1697,19 @@ mod tests {
             }
         );
         assert!(room_info_notable_update.is_empty());
+
+        // And the `RoomInfo` observable is notified too, so that subscribers of
+        // `Room::subscribe_info` re-read the hero profiles as well.
+        assert_ready!(room_info_subscriber);
+        assert_pending!(room_info_subscriber);
+
+        // Sanity check: Alice's hero carries the new status.
+        let heroes = room.heroes().await;
+        assert_eq!(heroes.len(), 1);
+        assert_eq!(heroes[0].user_id, alice);
+        let status = heroes[0].status.as_ref().expect("Alice's status should be set");
+        assert_eq!(status.text, "Away");
+        assert_eq!(status.emoji, "🌴");
     }
 
     #[async_test]

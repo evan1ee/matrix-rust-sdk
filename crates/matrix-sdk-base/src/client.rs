@@ -46,10 +46,11 @@ use ruma::{
         push_rules::{PushRulesEvent, PushRulesEventContent},
         room::member::SyncRoomMemberEvent,
     },
+    profile::UserProfileUpdate,
     push::Ruleset,
     time::Instant,
 };
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, MutexGuard, broadcast};
 #[cfg(feature = "e2e-encryption")]
 use tokio::sync::{RwLock, RwLockReadGuard};
 use tracing::{Level, debug, enabled, info, instrument, warn};
@@ -69,7 +70,8 @@ use crate::{
     store::{
         AvatarCache, BaseStateStore, DynStateStore, MemoryStore, Result as StoreResult,
         RoomLoadSettings, StateChanges, StateStoreDataKey, StateStoreDataValue, StateStoreExt,
-        StoreConfig, ambiguity_map::AmbiguityCache,
+        StoreConfig,
+        ambiguity_map::{AmbiguityCache, is_member_active},
     },
     sync::{RoomUpdates, SyncResponse},
 };
@@ -924,6 +926,7 @@ impl BaseClient {
             }
 
             if let StateEvent::Original(e) = &member
+                && is_member_active(&e.content.membership)
                 && let Some(d) = &e.content.displayname
             {
                 let display_name = DisplayName::new(d);
@@ -1158,6 +1161,55 @@ impl BaseClient {
         self.global_profile_updates_sender.subscribe()
     }
 
+    /// Our own global profile has been updated.
+    ///
+    /// Updates the internal and cached state accordingly, so the change is
+    /// observable before the next sync reflects it.
+    ///
+    /// **Note:** This method should only be called when global profile syncing
+    /// is enabled
+    pub async fn own_profile_updated(&self, update: UserProfileUpdate) -> Result<()> {
+        let own_user_id = self.session_meta().ok_or(Error::InsufficientData)?.user_id.clone();
+        let state_store_guard = self.state_store_lock().lock().await;
+
+        let mut changes = StateChanges::default();
+        changes.global_profiles.insert(own_user_id.clone(), update);
+        self.state_store.save_changes_with_guard(&state_store_guard, &changes).await?;
+
+        self.notify_global_profile_updates(BTreeSet::from([own_user_id]), &state_store_guard)
+    }
+
+    /// Notify the rest of the SDK that the global profiles of the given users
+    /// changed in the store.
+    ///
+    /// Broadcasts the changed user IDs, and nudges the `RoomInfo` of any room
+    /// where one of them is a hero so the hero fields are re-read.
+    pub(crate) fn notify_global_profile_updates(
+        &self,
+        user_ids: BTreeSet<OwnedUserId>,
+        #[cfg_attr(not(feature = "unstable-msc4426"), allow(unused_variables))]
+        state_store_guard: &MutexGuard<'_, ()>,
+    ) -> Result<()> {
+        if user_ids.is_empty() {
+            return Ok(());
+        }
+
+        // Nudge `RoomInfo` so hero status/call fields are re-read.
+        #[cfg(feature = "unstable-msc4426")]
+        for room in self.state_store.rooms() {
+            if room.hero_user_ids().iter().any(|hero| user_ids.contains(hero)) {
+                room.update_room_info_with_store_guard(state_store_guard, |room_info| {
+                    (room_info, RoomInfoNotableUpdateReasons::HEROES)
+                })
+                .map_err(crate::StoreError::from)?;
+            }
+        }
+
+        let _ = self.global_profile_updates_sender.send(user_ids);
+
+        Ok(())
+    }
+
     /// Checks whether the provided `user_id` belongs to an ignored user.
     pub async fn is_user_ignored(&self, user_id: &UserId) -> bool {
         match self.state_store.get_account_data_event_static::<IgnoredUserListEventContent>().await
@@ -1312,6 +1364,7 @@ mod tests {
         ProfileFieldValue, StatusProfileField, UserProfileChanges, UserProfileUpdate,
     };
     use ruma::{
+        RoomId,
         api::client::{self as api, sync::sync_events::v5},
         event_id,
         events::{StateEventType, room::member::MembershipState},
@@ -1804,6 +1857,77 @@ mod tests {
         assert_eq!(member.user_id(), user_id);
         assert_eq!(member.display_name().unwrap(), "Invited Alice");
         assert_eq!(member.avatar_url().unwrap().to_string(), "mxc://localhost/fewjilfewjil42");
+    }
+
+    async fn base_client_with_joined_room(room_id: &RoomId) -> BaseClient {
+        let client = logged_in_base_client(Some(user_id!("@alice:example.org"))).await;
+
+        let mut sync_builder = SyncResponseBuilder::new();
+        let response = sync_builder
+            .add_joined_room(matrix_sdk_test::JoinedRoomBuilder::new(room_id))
+            .build_sync_response();
+        client.receive_sync_response(response).await.unwrap();
+
+        client
+    }
+
+    #[async_test]
+    async fn test_inactive_members_do_not_make_a_display_name_ambiguous() {
+        let joined_user_id = user_id!("@bob:example.org");
+        let left_user_id = user_id!("@carol:example.org");
+        let room_id = room_id!("!ithpyNKDtmhneaTQja:example.org");
+
+        let client = base_client_with_joined_room(room_id).await;
+
+        // A joined member and a member who left share a display name.
+        let f = EventFactory::new().room(room_id);
+        let request = api::membership::get_member_events::v3::Request::new(room_id.to_owned());
+        let response = api::membership::get_member_events::v3::Response::new(vec![
+            f.member(joined_user_id).display_name("Amandine").into_raw(),
+            f.member(left_user_id)
+                .display_name("Amandine")
+                .membership(MembershipState::Leave)
+                .into_raw(),
+        ]);
+
+        client.receive_all_members(room_id, &request, &response).await.unwrap();
+
+        let room = client.get_room(room_id).unwrap();
+        let member = room.get_member(joined_user_id).await.expect("ok").expect("exists");
+
+        assert_eq!(member.display_name().unwrap(), "Amandine");
+        assert!(!member.name_ambiguous());
+    }
+
+    #[async_test]
+    async fn test_active_members_make_a_display_name_ambiguous() {
+        let joined_user_id = user_id!("@bob:example.org");
+        let invited_user_id = user_id!("@carol:example.org");
+        let room_id = room_id!("!ithpyNKDtmhneaTQja:example.org");
+
+        let client = base_client_with_joined_room(room_id).await;
+
+        // A joined member and an invited member share a display name.
+        let f = EventFactory::new().room(room_id);
+        let request = api::membership::get_member_events::v3::Request::new(room_id.to_owned());
+        let response = api::membership::get_member_events::v3::Response::new(vec![
+            f.member(joined_user_id).display_name("Amandine").into_raw(),
+            f.member(invited_user_id)
+                .display_name("Amandine")
+                .membership(MembershipState::Invite)
+                .into_raw(),
+        ]);
+
+        client.receive_all_members(room_id, &request, &response).await.unwrap();
+
+        // Then both display names are ambiguous.
+        let room = client.get_room(room_id).unwrap();
+
+        let joined = room.get_member(joined_user_id).await.expect("ok").expect("exists");
+        assert!(joined.name_ambiguous());
+
+        let invited = room.get_member(invited_user_id).await.expect("ok").expect("exists");
+        assert!(invited.name_ambiguous());
     }
 
     #[cfg(feature = "unstable-msc4426")]

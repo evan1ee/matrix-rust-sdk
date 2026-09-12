@@ -14,7 +14,6 @@
 
 use std::{fmt::Debug, sync::Arc};
 
-use futures_util::pin_mut;
 use matrix_sdk::Client;
 use matrix_sdk_common::{SendOutsideWasm, SyncOutsideWasm};
 use matrix_sdk_ui::{
@@ -80,11 +79,11 @@ impl SyncService {
     }
 
     pub fn state(&self, listener: Box<dyn SyncServiceStateObserver>) -> Arc<TaskHandle> {
-        let state_stream = self.inner.state();
+        let mut state_stream = self.inner.state();
+
+        listener.on_update(state_stream.next_now().into());
 
         Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
-            pin_mut!(state_stream);
-
             while let Some(state) = state_stream.next().await {
                 listener.on_update(state.into());
             }
@@ -125,16 +124,6 @@ impl SyncServiceBuilder {
     pub fn with_share_pos(self: Arc<Self>, enable: bool) -> Arc<Self> {
         let this = unwrap_or_clone_arc(self);
         let builder = this.builder.with_share_pos(enable);
-        Arc::new(Self { builder, ..this })
-    }
-
-    /// Enable the Profiles sliding sync extension for the room list service.
-    ///
-    /// Required to merge the global `m.status` and `m.call` fields into the
-    /// room members and profiles read from the SDK.
-    pub fn with_profiles_extension(self: Arc<Self>) -> Arc<Self> {
-        let this = unwrap_or_clone_arc(self);
-        let builder = this.builder.with_profiles_extension();
         Arc::new(Self { builder, ..this })
     }
 

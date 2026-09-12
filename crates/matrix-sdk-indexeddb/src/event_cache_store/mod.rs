@@ -18,8 +18,9 @@ use std::{collections::HashMap, rc::Rc, time::Duration};
 
 use indexed_db_futures::{Build, database::Database};
 #[cfg(target_family = "wasm")]
-use matrix_sdk_base::cross_process_lock::{
-    CrossProcessLockGeneration, FIRST_CROSS_PROCESS_LOCK_GENERATION,
+use matrix_sdk_base::{
+    cross_process_lock::{CrossProcessLockGeneration, FIRST_CROSS_PROCESS_LOCK_GENERATION},
+    event_cache::thread::ThreadInfo,
 };
 use matrix_sdk_base::{
     event_cache::{Event, Gap, store::EventCacheStore},
@@ -149,7 +150,7 @@ impl EventCacheStore for IndexeddbEventCacheStore {
         };
 
         Ok(if let Some(lease) = lease {
-            transaction.put_lease(&lease).await?;
+            transaction.put_lease(&lease)?;
             transaction.commit().await?;
 
             Some(lease.generation)
@@ -187,13 +188,11 @@ impl EventCacheStore for IndexeddbEventCacheStore {
                 }
                 Update::NewGapChunk { previous, new, next, gap } => {
                     trace!(%linked_chunk_id, "Inserting new gap (prev={previous:?}, new={new:?}, next={next:?})");
-                    transaction
-                        .add_item(&types::Gap {
-                            linked_chunk_id: linked_chunk_id.to_owned(),
-                            chunk_identifier: new.index(),
-                            token: gap.token,
-                        })
-                        .await?;
+                    transaction.add_item(&types::Gap {
+                        linked_chunk_id: linked_chunk_id.to_owned(),
+                        chunk_identifier: new.index(),
+                        token: gap.token,
+                    })?;
                     transaction
                         .add_chunk(&types::Chunk {
                             linked_chunk_id: linked_chunk_id.to_owned(),
@@ -416,17 +415,51 @@ impl EventCacheStore for IndexeddbEventCacheStore {
     }
 
     #[instrument(skip(self))]
-    async fn remember_thread(
+    async fn load_thread_info(
         &self,
         room_id: &RoomId,
         thread_id: &EventId,
+    ) -> Result<ThreadInfo, Self::Error> {
+        let _timer = timer!("method");
+
+        let transaction = self.transaction(&[keys::THREADS], IdbTransactionMode::Readonly)?;
+
+        if let Some(thread) = transaction.load_thread_info(room_id, thread_id).await? {
+            return Ok(thread.info);
+        }
+
+        drop(transaction);
+
+        let transaction = self.transaction(&[keys::THREADS], IdbTransactionMode::Readwrite)?;
+
+        let thread = Thread {
+            room_id: room_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            info: ThreadInfo::new(),
+        };
+        transaction.update_thread_info(&thread)?;
+        transaction.commit().await?;
+
+        Ok(thread.info)
+    }
+
+    #[instrument(skip(self))]
+    async fn update_thread_info(
+        &self,
+        room_id: &RoomId,
+        thread_id: &EventId,
+        thread_info: &ThreadInfo,
     ) -> Result<(), Self::Error> {
         let _timer = timer!("method");
 
         let transaction = self.transaction(&[keys::THREADS], IdbTransactionMode::Readwrite)?;
-        let thread = Thread { room_id: room_id.to_owned(), thread_id: thread_id.to_owned() };
 
-        transaction.put_thread(&thread).await?;
+        let thread = Thread {
+            room_id: room_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            info: thread_info.clone(),
+        };
+        transaction.update_thread_info(&thread)?;
         transaction.commit().await?;
 
         Ok(())
@@ -447,9 +480,9 @@ impl EventCacheStore for IndexeddbEventCacheStore {
         match room_id {
             // Clear all events.
             None => {
-                transaction.clear::<types::Chunk>().await?;
-                transaction.clear::<types::Event>().await?;
-                transaction.clear::<types::Gap>().await?;
+                transaction.clear::<types::Chunk>()?;
+                transaction.clear::<types::Event>()?;
+                transaction.clear::<types::Gap>()?;
                 transaction.commit().await?;
             }
 

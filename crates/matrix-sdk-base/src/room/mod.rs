@@ -56,6 +56,7 @@ use ruma::{
             join_rules::JoinRule,
             member::MembershipState,
             power_levels::{RoomPowerLevels, RoomPowerLevelsEventContent, RoomPowerLevelsSource},
+            retention::RoomRetentionEventContent,
         },
     },
     room::RoomType,
@@ -71,7 +72,7 @@ use crate::{
     DmRoomDefinition, Error, StateStore,
     deserialized_responses::MemberEvent,
     notification_settings::RoomNotificationMode,
-    read_receipts::RoomReadReceipts,
+    read_receipts::ReadReceipts,
     store::{Result as StoreResult, SaveLockedStateStore, StateStoreExt},
     sync::UnreadNotificationsCount,
 };
@@ -207,7 +208,7 @@ impl Room {
     }
 
     /// Get the detailed information about read receipts for the room.
-    pub fn read_receipts(&self) -> RoomReadReceipts {
+    pub fn read_receipts(&self) -> ReadReceipts {
         self.info.read().read_receipts.clone()
     }
 
@@ -377,6 +378,11 @@ impl Room {
         self.info.read().base_info.max_power_level
     }
 
+    /// Get the message retention policy of this room, if set.
+    pub fn retention(&self) -> Option<RoomRetentionEventContent> {
+        self.info.read().retention().cloned()
+    }
+
     /// Get the service members in this room, if available.
     pub fn service_members(&self) -> Option<BTreeSet<OwnedUserId>> {
         self.info.read().service_members().cloned()
@@ -497,6 +503,11 @@ impl Room {
             }
         };
 
+        // Short-circuiting if there is no heroes: we can't do anything.
+        if heroes.is_empty() {
+            return Vec::new();
+        }
+
         // Return with empty profile fields when the user status feature is disabled.
         #[cfg(not(feature = "unstable-msc4426"))]
         {
@@ -544,10 +555,12 @@ impl Room {
     pub async fn load_user_receipt(
         &self,
         receipt_type: ReceiptType,
-        thread: ReceiptThread,
+        receipt_thread: &ReceiptThread,
         user_id: &UserId,
     ) -> StoreResult<Option<(OwnedEventId, Receipt)>> {
-        self.store.get_user_room_receipt_event(self.room_id(), receipt_type, thread, user_id).await
+        self.store
+            .get_user_room_receipt_event(self.room_id(), receipt_type, receipt_thread, user_id)
+            .await
     }
 
     /// Load from storage the receipts as a list of `OwnedUserId` and `Receipt`
@@ -556,11 +569,11 @@ impl Room {
     pub async fn load_event_receipts(
         &self,
         receipt_type: ReceiptType,
-        thread: ReceiptThread,
+        receipt_thread: &ReceiptThread,
         event_id: &EventId,
     ) -> StoreResult<Vec<(OwnedUserId, Receipt)>> {
         self.store
-            .get_event_room_receipt_events(self.room_id(), receipt_type, thread, event_id)
+            .get_event_room_receipt_events(self.room_id(), receipt_type, receipt_thread, event_id)
             .await
     }
 
@@ -765,6 +778,75 @@ mod tests {
         let heroes = room.heroes().await;
         assert_eq!(heroes.len(), 1);
         assert_eq!(heroes[0].user_id, alice_id);
+    }
+
+    #[async_test]
+    async fn test_human_member_ids_filters_out_service_members() {
+        let client = logged_in_base_client(None).await;
+        let user_id = &client.session_meta().unwrap().user_id;
+        let service_member_id = user_id!("@service:example.org");
+        let alice_id = user_id!("@alice:example.org");
+        let bob_id = user_id!("@bob:example.org");
+        let room_id = room_id!("!room:example.org");
+
+        let room = client.get_or_create_room(room_id, RoomState::Joined);
+        let factory = EventFactory::new().room(room_id);
+
+        let service_member_hint =
+            factory.member_hints(BTreeSet::from([service_member_id.to_owned()])).sender(user_id);
+        let alice_joins = factory.member(alice_id);
+        let service_member_joins = factory.member(service_member_id);
+        let bob_leaves = factory.member(bob_id).membership(MembershipState::Leave);
+
+        let mut sync_builder = SyncResponseBuilder::new();
+        let response = sync_builder
+            .add_joined_room(
+                JoinedRoomBuilder::new(room_id)
+                    .add_state_event(service_member_hint)
+                    .add_state_event(alice_joins)
+                    .add_state_event(service_member_joins)
+                    .add_state_event(bob_leaves),
+            )
+            .build_sync_response();
+
+        client.receive_sync_response(response).await.unwrap();
+
+        assert_eq!(
+            room.human_member_ids(RoomMemberships::ACTIVE).await.unwrap(),
+            vec![alice_id.to_owned()]
+        );
+        assert_eq!(
+            room.human_member_ids(RoomMemberships::empty())
+                .await
+                .unwrap()
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([alice_id.to_owned(), bob_id.to_owned()])
+        );
+    }
+
+    #[async_test]
+    async fn test_human_member_ids_without_member_hints() {
+        let client = logged_in_base_client(None).await;
+        let alice_id = user_id!("@alice:example.org");
+        let room_id = room_id!("!room:example.org");
+
+        let room = client.get_or_create_room(room_id, RoomState::Joined);
+        let factory = EventFactory::new().room(room_id);
+
+        let alice_joins = factory.member(alice_id);
+
+        let mut sync_builder = SyncResponseBuilder::new();
+        let response = sync_builder
+            .add_joined_room(JoinedRoomBuilder::new(room_id).add_state_event(alice_joins))
+            .build_sync_response();
+
+        client.receive_sync_response(response).await.unwrap();
+
+        assert_eq!(
+            room.human_member_ids(RoomMemberships::ACTIVE).await.unwrap(),
+            vec![alice_id.to_owned()]
+        );
     }
 
     #[cfg(feature = "unstable-msc4426")]
